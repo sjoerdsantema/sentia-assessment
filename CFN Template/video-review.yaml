@@ -1,0 +1,339 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack for assessment question 4
+Parameters:
+  ApprovedBucketName:
+    Type: String
+    Description: (dont change name) Name of bucket to store the approved videos 
+    Default: "approved-bucket"
+  NonApprovedBucketName:
+    Type: String
+    Description: (dont change name) Name of bucket to store the non-approved videos 
+    Default: "non-approved-files"
+  EmailAdmin:
+    Type: String
+    Description: Email address of admin for notification
+    Default: "sjoerdsantema@gmail.com"
+Resources:
+  #this is the api for the approval process
+  ApprovalApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties: 
+      Name: "Approval-Api"
+      Description: "API to approve and move videos"
+      FailOnWarnings: true
+  #to retrieve the api-id in lambda we put it in SSM parameter store / bit of a hack..
+  PutApiIdInSsmParameterStore:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "api-id"
+      Type: "String"
+      Value: !Ref ApprovalApi
+      Description: "Api-Id, for use in Lambda"
+  ApprovalApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt ApprovalLambda.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Join 
+        - ""
+        - - "arn:aws:execute-api:"
+          - !Ref AWS::Region 
+          - ":" 
+          - !Ref AWS::AccountId 
+          - ":" 
+          - !Ref ApprovalApi 
+          - "/*"  
+  ApprovalApiStage: 
+    DependsOn : ApiGatewayAccount
+    Type: AWS::ApiGateway::Stage
+    Properties: 
+      DeploymentId: !Ref ApiDeployment
+      MethodSettings: 
+        - DataTraceEnabled: true
+          HttpMethod: "*"
+          LoggingLevel: "INFO"
+          ResourcePath: "/*"
+      RestApiId: !Ref ApprovalApi
+      StageName: "LATEST"
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+  ApiGatewayCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal: 
+              Service:
+                - "apigateway.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"      
+      Policies:
+        -
+          PolicyName: "ApiGatewayLogsPolicy"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeLogStreams"
+                  - "logs:PutLogEvents"
+                  - "logs:GetLogEvents"
+                  - "logs:FilterLogEvents"
+                Resource:
+                  "*"
+  ApiDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn: ApprovalRequest
+    Properties:
+      RestApiId: !Ref ApprovalApi
+      StageName: "DummyStage"
+  #approve the video lambda
+  ApprovalLambda: 
+    Type: "AWS::Lambda::Function"
+    Properties: 
+      Handler: "lambda_function.lambda_handler"
+      Role: 
+        !GetAtt LambdaApprovalRole.Arn
+      Code: 
+        S3Bucket: "lambda-for-assessment"
+        S3Key: "videoapprovelambda.zip"
+      Runtime: "python3.6"
+      Timeout: 60 
+  LambdaApprovalRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies: 
+        - 
+          PolicyName: "LambdaApprovalPolicy"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              -
+                Effect: "Allow"
+                Action: 
+                  - "s3:*"
+                Resource: "*"
+  ApprovalResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref ApprovalApi
+      ParentId: !GetAtt ApprovalApi.RootResourceId
+      PathPart: "approval"
+  ApprovalRequest:
+    DependsOn: ApprovalApiPermission
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "GET"
+      Integration:
+        Type: "AWS"
+        IntegrationHttpMethod: "POST"
+        Uri: !Join 
+          - ""
+          - - "arn:aws:apigateway:"
+            - !Ref AWS::Region 
+            - ":lambda:path/2015-03-31/functions/"
+            - !GetAtt ApprovalLambda.Arn
+            - "/invocations"
+        IntegrationResponses:
+        - "StatusCode" : "200"
+        RequestTemplates:
+          "application/json": !Join 
+            - ""
+            - - "{"
+              - "\"approval\": \"$input.params('approval')\""
+              - "}"
+      RequestParameters: 
+          "method.request.querystring.approval" : false 
+      ResourceId: !Ref ApprovalResource
+      RestApiId: !Ref ApprovalApi
+      MethodResponses:
+        - "StatusCode" : "200" 
+  #the bucket for approved videos
+  ApprovedBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Ref ApprovedBucketName
+  #the bucket for the transcoded but non-approved videos
+  NonApprovedBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Ref NonApprovedBucketName
+      LifecycleConfiguration: 
+          Rules:
+            - Id: "Delete after 90 days"
+              Prefix: "" 
+              Status: Enabled
+              ExpirationInDays: 90
+  #create the role for AWS ET and the Lambda function
+  TranscoderRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "elastictranscoder.amazonaws.com"
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      RoleName: "Transcoder_Role_Name"
+      Policies: 
+        - 
+          PolicyName: "TranscoderPolicy"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - 
+                Sid: "1"
+                Effect: "Allow"
+                Action: 
+                  - "s3:Put*"
+                  - "s3:ListBucket"
+                  - "s3:*MultipartUpload*"
+                  - "s3:Get*"
+                Resource: "*"
+              -
+                Sid: "2"
+                Effect: "Allow"
+                Action: 
+                  - "sns:publish"
+                Resource: "*"
+              -          
+                Sid: "3"
+                Effect: "Deny"
+                Action: 
+                  - "s3:*Delete*"
+                  - "s3:*Policy*"
+                  - "sns:*Remove*"
+                  - "sns:*Delete*"
+                  - "sns:*Permission*"
+                Resource: "*"
+  LambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "lambda.amazonaws.com"
+                - "events.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies: 
+        - 
+          PolicyName: "LambdaPolicy"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - 
+                Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              -
+                Effect: "Allow"
+                Action: 
+                  - "elastictranscoder:*"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action: 
+                  - "ssm:GetParameter"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action: 
+                  - "ses:*"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action: 
+                  - "iam:PassRole"
+                  - "iam:GetRole"
+                  - "iam:ListRoles"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action: 
+                  - "s3:*"
+                Resource: "*"
+  #create the lambda function
+  VideoReviewLambda: 
+    Type: "AWS::Lambda::Function"
+    Properties: 
+      Handler: "lambda_function.lambda_handler"
+      Role: 
+        !GetAtt LambdaRole.Arn
+      Code: 
+        S3Bucket: "lambda-for-assessment"
+        S3Key: "videoreviewlambda.zip"
+      Runtime: "python3.6"
+      Timeout: 60
+  #create the origin bucket 
+  OriginBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: "video-review-origin"
+      LifecycleConfiguration: 
+          Rules:
+            - Id: "Delete after 30 days"
+              Prefix: "" 
+              Status: Enabled
+              ExpirationInDays: 30
+  #fire up the lambda every set period
+  MyEventName:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: check bucket for new video files to convert
+      Name: CheckOriginVideoBucket
+      ScheduleExpression: "rate(2 minutes)"
+      State: ENABLED
+      RoleArn: !GetAtt LambdaRole.Arn
+      Targets:
+        -
+          Arn: !GetAtt VideoReviewLambda.Arn
+          Id: "VideoReviewLambda"
+          Input: '{"key": "value"}'
+  EventPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt VideoReviewLambda.Arn
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt MyEventName.Arn
+
